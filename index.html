@@ -178,7 +178,16 @@ body {
     animation: cardIn 0.35s ease;
     flex-shrink: 0; /* 防止卡片被挤压 */
     width: 100%; max-width: var(--content-max); /* 随窗口宽度分档递增 */
+    position: relative;
 }
+.card-close {
+    position: absolute; top: 8px; right: 8px; z-index: 2;
+    width: 24px; height: 24px; border: none; border-radius: 50%;
+    background: rgba(0,0,0,0.45); color: #fff; font-size: 12px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; opacity: 0.8; transition: opacity 0.15s, background 0.15s;
+}
+.card-close:hover { opacity: 1; background: var(--danger); }
 @keyframes cardIn {
     from { opacity: 0; transform: translateY(10px); }
     to { opacity: 1; transform: translateY(0); }
@@ -238,16 +247,6 @@ body {
     text-align: center;
 }
 .card-err-tip { color: var(--danger); word-break: break-word; }
-
-/* 取消按钮 */
-.btn-cancel {
-    margin-top: 4px; padding: 5px 16px;
-    border: 1px solid var(--border-light); border-radius: 6px;
-    background: transparent; color: var(--fg-muted);
-    font-size: 12px; cursor: pointer; font-family: inherit; transition: all 0.2s;
-}
-.btn-cancel:hover { border-color: var(--danger); color: var(--danger); }
-.btn-cancel:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* 加载 */
 .card-loading .card-body { min-height: 180px; align-items: center; }
@@ -646,10 +645,7 @@ body {
 
 <script>
 /* ========== 全局状态 ========== */
-let busy = false;
-let currentPrompt = '';
-let currentRefImgs = [];
-let currentGenId = '';   /* 当前正在进行的生成批次 id */
+let genPrompts = {};     /* gen_id -> 该批次的提示词，支持多个批次同时生成 */
 let attachedImages = []; /* {dataUrl, mime} */
 /* 灯箱变换状态：scale=缩放倍数，tx/ty=平移偏移(px)，rotate=旋转角度，flipH/flipV=镜像 */
 let lbScale = 1, lbTx = 0, lbTy = 0, lbRotate = 0, lbFlipH = false, lbFlipV = false;
@@ -813,9 +809,15 @@ async function copyLbImg() {
     var img = document.getElementById('lightboxImg');
     if (!img || !img.src) return;
     try {
-        var res = await fetch(img.src);
-        var blob = await res.blob();
-        await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+        // 不要提前 await 拿 blob 再传值：Safari/WebKit 要求 clipboard.write
+        // 在用户手势内同步调用，提前 await 会丢失手势上下文导致写入被拒绝。
+        // 这里把 fetch().then(blob) 的 Promise 直接交给 ClipboardItem。
+        var src = img.src;
+        await navigator.clipboard.write([
+            new ClipboardItem({
+                'image/png': fetch(src).then(function(res) { return res.blob(); })
+            })
+        ]);
         toast('已复制到剪贴板', 'ok');
     } catch(e) { toast('复制失败', 'err'); }
 }
@@ -825,51 +827,30 @@ function findGenCard(genId) {
     return document.querySelector('.card[data-gen-id="' + genId + '"]');
 }
 
-function endBusy() {
-    busy = false;
-    currentGenId = '';
-    currentRefImgs = [];
-    window.__currentRefImgs = [];
-    document.getElementById('btnGen').disabled = false;
-}
-
 /* 每生成完一张就回填一张 */
-window.__onGenItem = function(genId, b64, entryId, index, total) {
+window.__onGenItem = async function(genId, entryId, index, total) {
+    var prompt = genPrompts[genId] || '';
     var card = findGenCard(genId);
     if (card) {
-        appendGridItem(card, currentPrompt, b64, entryId);
         var prog = card.querySelector('.loader-progress');
         if (prog) prog.textContent = '已完成 ' + index + '/' + total + '，继续生成…';
     }
-    addHistory(entryId, currentPrompt, b64, false, currentRefImgs);
-    scrollEnd();
+    /* 只收到 entryId 通知，图片本体走标准 JS-API 桥按需取，避免把大体量 base64 拼进 evaluate_js 字符串 */
+    try {
+        var data = await window.pywebview.api.get_history_item(entryId);
+        if (!data || !data.ok) return;
+        if (card) appendGridItem(card, prompt, data.image, entryId);
+        addHistory(entryId, prompt, data.thumbnail, data.thumb_mime, false);
+        scrollEnd();
+    } catch(e) { console.error(e); }
 };
 
 /* 整批完成 */
 window.__onGenDone = function(genId, got) {
     var card = findGenCard(genId);
-    if (card) finalizeGenCard(card, currentPrompt);
-    endBusy();
+    if (card) finalizeGenCard(card, genPrompts[genId] || '');
+    delete genPrompts[genId];
     scrollEnd();
-};
-
-/* 用户取消：保留已生成的图片 */
-window.__onGenCanceled = function(genId) {
-    var card = findGenCard(genId);
-    if (card) {
-        var hasItem = card.querySelector('.grid-item');
-        if (hasItem) {
-            finalizeGenCard(card, currentPrompt);
-            var tip = document.createElement('div');
-            tip.className = 'card-canceled-tip';
-            tip.textContent = '已取消，保留上面已生成的图片';
-            card.appendChild(tip);
-        } else {
-            card.remove();
-        }
-    }
-    endBusy();
-    toast('已取消生成', 'ok');
 };
 
 /* 批量中途某张失败，但已有成功结果 */
@@ -879,8 +860,8 @@ window.__onGenPartial = function(genId) {
 
 window.__onGenError = function(genId, msg) {
     var card = findGenCard(genId);
-    if (card) toErrorCard(card, currentPrompt, msg);
-    endBusy();
+    if (card) toErrorCard(card, genPrompts[genId] || '', msg);
+    delete genPrompts[genId];
     scrollEnd();
 };
 
@@ -1119,7 +1100,6 @@ function genId() {
 }
 
 function doGenerate() {
-    if (busy) return;
     var prompt = document.getElementById('inp').value.trim();
     var hasImages = attachedImages.length > 0;
     if (!prompt) { toast('请输入提示词', 'err'); return; }
@@ -1129,19 +1109,14 @@ function doGenerate() {
     var refImgs = attachedImages.map(function(item) { return item.dataUrl; });
 
     var gid = genId();
-    currentGenId = gid;
-    currentPrompt = prompt;
-    currentRefImgs = refImgs;
-    window.__currentPrompt = prompt;
-    window.__currentRefImgs = refImgs;
+    genPrompts[gid] = prompt;
     document.getElementById('emptyState').style.display = 'none';
 
     var card = mkLoadingCard(gid, prompt, refImgs, count);
     document.getElementById('mainArea').appendChild(card);
     scrollEnd();
 
-    busy = true;
-    document.getElementById('btnGen').disabled = true;
+    /* 每个批次独立进行，不禁用生成按钮，允许在当前批次未完成时继续发起新的生成 */
     document.getElementById('inp').value = '';
     document.getElementById('inp').style.height = '38px';
     document.getElementById('inp').style.overflowY = 'hidden';
@@ -1149,22 +1124,10 @@ function doGenerate() {
     renderAttachStrip();
 
     if (hasImages) {
-        window.pywebview.api.edit_image(size, quality, count, gid);
+        window.pywebview.api.edit_image(prompt, refImgs, size, quality, count, gid);
     } else {
-        window.pywebview.api.generate(size, quality, count, gid);
+        window.pywebview.api.generate(prompt, size, quality, count, gid);
     }
-}
-
-function cancelGenerate(gid) {
-    if (!gid) return;
-    var card = findGenCard(gid);
-    if (card) {
-        var btn = card.querySelector('.btn-cancel');
-        if (btn) { btn.disabled = true; btn.textContent = '取消中…'; }
-        var prog = card.querySelector('.loader-progress');
-        if (prog) prog.textContent = '正在取消…';
-    }
-    window.pywebview.api.cancel_generation(gid);
 }
 
 /* ========== 卡片构建 ========== */
@@ -1174,7 +1137,7 @@ function refImgsHtml(refImgs) {
     return '<div class="card-refimgs">' + imgs + '</div>';
 }
 
-/* 生成中的卡片：顶部提示词 + 图片网格（陆续填充）+ 加载条/取消按钮 */
+/* 生成中的卡片：顶部提示词 + 图片网格（陆续填充）+ 加载条 */
 function mkLoadingCard(gid, prompt, refImgs, count) {
     var d = document.createElement('div');
     d.className = 'card card-loading';
@@ -1187,10 +1150,8 @@ function mkLoadingCard(gid, prompt, refImgs, count) {
             '<div class="loader">' +
                 '<div class="spinner"></div>' +
                 '<span class="loader-progress">正在生成' + countTip + '，请稍候...</span>' +
-                '<button class="btn-cancel" data-act="cancel">取消生成</button>' +
             '</div>' +
         '</div>';
-    d.querySelector('[data-act="cancel"]').onclick = function() { cancelGenerate(gid); };
     return d;
 }
 
@@ -1230,11 +1191,12 @@ function finalizeGenCard(card, prompt) {
     if (body) body.remove();
 }
 
-/* 直接构建一张已完成的卡片（用于历史记录还原） */
+/* 直接构建一张已完成的卡片（用于历史记录还原），带关闭按钮以便从主区移除 */
 function buildDoneCard(prompt, refImgs, items) {
     var card = document.createElement('div');
     card.className = 'card';
     card.innerHTML =
+        '<button class="card-close" title="关闭">✕</button>' +
         '<div class="card-prompt"><strong>你：</strong>' + esc(prompt) + refImgsHtml(refImgs) + '</div>' +
         '<div class="card-grid" data-count="' + items.length + '"></div>';
     var grid = card.querySelector('.card-grid');
@@ -1245,20 +1207,31 @@ function buildDoneCard(prompt, refImgs, items) {
         grid.appendChild(item);
         bindGridItem(item, prompt);
     });
+    card.querySelector('.card-close').onclick = function() {
+        card.remove();
+        if (!document.querySelector('#mainArea .card')) {
+            document.getElementById('emptyState').style.display = '';
+        }
+    };
     return card;
 }
 
-/* 点击历史记录：若主体区已有对应图片则定位过去，否则新建一张 */
-function restoreHistoryToMain(entryId, prompt, b64, refImgs) {
+/* 点击历史记录：若主体区已有对应图片则定位过去，否则按需拉取原图后新建一张 */
+async function restoreHistoryToMain(entryId) {
     var existing = document.querySelector('.grid-item[data-entry-id="' + entryId + '"]');
     if (existing) {
         existing.scrollIntoView({ behavior: 'smooth', block: 'center' });
         return;
     }
-    document.getElementById('emptyState').style.display = 'none';
-    var card = buildDoneCard(prompt, refImgs, [{ b64: b64, entryId: entryId }]);
-    document.getElementById('mainArea').appendChild(card);
-    scrollEnd();
+    try {
+        var data = await window.pywebview.api.get_history_item(entryId);
+        if (!data || !data.ok) { toast('记录不存在或已被删除', 'err'); return; }
+        var refImgs = (data.ref_images || []).map(function(b) { return 'data:image/png;base64,' + b; });
+        document.getElementById('emptyState').style.display = 'none';
+        var card = buildDoneCard(data.prompt, refImgs, [{ b64: data.image, entryId: entryId }]);
+        document.getElementById('mainArea').appendChild(card);
+        scrollEnd();
+    } catch(e) { console.error(e); toast('加载失败', 'err'); }
 }
 
 function toErrorCard(card, prompt, msg) {
@@ -1323,19 +1296,19 @@ function fallbackCopy(text) {
 async function loadHistory() {
     try {
         var entries = await window.pywebview.api.get_history();
+        /* 侧边栏只加载缩略图，原图/参考图等到用户点开对应记录时再按需拉取 */
         entries.forEach(function(entry) {
-            var refImgs = (entry.ref_images || []).map(function(b) { return 'data:image/png;base64,' + b; });
-            addHistory(entry.id, entry.prompt, entry.image, true, refImgs);
+            addHistory(entry.id, entry.prompt, entry.thumbnail, entry.thumb_mime, true);
         });
     } catch(e) { console.error(e); }
 }
 
-function addHistory(entryId, prompt, b64, append, refImgs) {
+function addHistory(entryId, prompt, thumbB64, thumbMime, append) {
     var sidebar = document.getElementById('sidebar');
     var empty = document.getElementById('sidebarEmpty');
     if (empty) empty.remove();
 
-    var imgSrc = 'data:image/png;base64,' + b64;
+    var imgSrc = 'data:' + (thumbMime || 'image/png') + ';base64,' + thumbB64;
     var item = document.createElement('div');
     item.className = 'hist-item';
     item.dataset.id = entryId;
@@ -1345,7 +1318,7 @@ function addHistory(entryId, prompt, b64, append, refImgs) {
             '<button class="hist-del" title="删除记录" data-act="del">✕</button>' +
         '</div>' +
         '<div class="hist-prompt">' + esc(prompt) + '</div>';
-    item.querySelector('img').onclick = function() { restoreHistoryToMain(entryId, prompt, b64, refImgs); };
+    item.querySelector('img').onclick = function() { restoreHistoryToMain(entryId); };
     item.querySelector('[data-act="del"]').onclick = function(e) {
         e.stopPropagation();
         if (confirm('确定要删除这条历史记录吗？')) {

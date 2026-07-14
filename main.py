@@ -9,9 +9,14 @@ import io
 import threading
 import uuid
 from openai import OpenAI
+from PIL import Image
 
 # 固定的中转站地址，不允许用户修改
 BASE_URL = "https://tdyun.ai/v1"
+# 历史记录最多保留的条数，超出后自动清理最旧的记录及其图片文件
+MAX_HISTORY_ENTRIES = 300
+# 侧边栏缩略图长边上限（像素），缩略图仅用于列表展示，无需原图分辨率
+THUMB_MAX_SIZE = 240
 
 
 class Api:
@@ -24,13 +29,15 @@ class Api:
         self.base_url = BASE_URL
         self.model = "gpt-image-2"
         self.theme = "dark"  # 界面主题：dark / light
-        # 生成任务的取消标记：记录已被用户取消的 gen_id
-        self._canceled = set()
-        self._cancel_lock = threading.Lock()
         self._load_config()
 
     def _get_config_path(self):
-        if getattr(sys, 'frozen', False):
+        if sys.platform == 'darwin':
+            # macOS: 存到用户目录下的 ~/.tdyun，避免写入 .app 包内部（权限/签名问题）
+            data_dir = os.path.join(os.path.expanduser('~'), '.tdyun')
+            os.makedirs(data_dir, exist_ok=True)
+            return os.path.join(data_dir, 'config.json')
+        elif getattr(sys, 'frozen', False):
             return os.path.join(os.path.dirname(sys.executable), 'config.json')
         else:
             return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
@@ -70,7 +77,6 @@ class Api:
     def _write_config(self):
         with open(self.config_path, 'w', encoding='utf-8') as f:
             json.dump({
-                'base_url': self.base_url,
                 'api_key': self.key,
                 'model': self.model,
                 'theme': self.theme
@@ -133,22 +139,6 @@ class Api:
                 msg = msg[:260] + '...'
             return {'ok': False, 'msg': '连接失败：' + msg}
 
-    def cancel_generation(self, gen_id):
-        """标记某个生成任务为已取消。已发出的 API 请求无法真正中断，
-        但结果返回后会被丢弃，不再回填到页面。"""
-        if gen_id:
-            with self._cancel_lock:
-                self._canceled.add(gen_id)
-        return {'success': True}
-
-    def _is_canceled(self, gen_id):
-        with self._cancel_lock:
-            return gen_id in self._canceled
-
-    def _clear_canceled(self, gen_id):
-        with self._cancel_lock:
-            self._canceled.discard(gen_id)
-
     def _js(self, expr):
         """把一段 JS 推回页面执行；窗口已关闭等异常时静默忽略。"""
         try:
@@ -156,11 +146,13 @@ class Api:
         except Exception:
             pass
 
-    def _push_item(self, gen_id, b64, entry_id, index, total):
+    def _push_item(self, gen_id, entry_id, index, total):
+        """只通知前端"有一张图生成好了"，不把图片数据拼进 JS 字符串。
+        前端收到通知后通过 get_history_item 走标准的 JS-API 桥获取图片本体，
+        避免大体量 base64 直接拼接进 evaluate_js 造成的潜在卡顿/字符串问题。"""
         self._js(
             '__onGenItem(' +
             json.dumps(gen_id, ensure_ascii=False) + ',' +
-            json.dumps(b64, ensure_ascii=False) + ',' +
             json.dumps(entry_id, ensure_ascii=False) + ',' +
             str(index) + ',' + str(total) + ')'
         )
@@ -172,35 +164,33 @@ class Api:
             count = 1
         return max(1, min(4, count))
 
-    def edit_image(self, size="1024x1024", quality="auto", count=1, gen_id=""):
-        """图生图/带参考图生成：提示词和参考图（data URL 列表）都从页面 JS 变量里读取，避免长字符串作为调用参数传递"""
-        self._start_batch(size, quality, count, gen_id, is_edit=True)
+    def edit_image(self, prompt="", ref_data_urls=None, size="1024x1024", quality="auto", count=1, gen_id=""):
+        """图生图/带参考图生成：prompt/参考图都作为参数直接传入，支持多个批次并发进行"""
+        self._start_batch(prompt, ref_data_urls or [], size, quality, count, gen_id, is_edit=True)
 
-    def generate(self, size="1024x1024", quality="auto", count=1, gen_id=""):
-        """文生图：不在参数里传长文本，改为从 JS 变量里读取，防止窗口卡死"""
-        self._start_batch(size, quality, count, gen_id, is_edit=False)
+    def generate(self, prompt="", size="1024x1024", quality="auto", count=1, gen_id=""):
+        """文生图：支持与其他批次并发进行"""
+        self._start_batch(prompt, [], size, quality, count, gen_id, is_edit=False)
 
-    def _start_batch(self, size, quality, count, gen_id, is_edit):
+    def _start_batch(self, prompt, ref_data_urls, size, quality, count, gen_id, is_edit):
         if not self.key:
             self._js('__onGenError(' + json.dumps(gen_id, ensure_ascii=False) +
                      ', "请先在设置中配置 API Key")')
             return
         count = self._sanitize_count(count)
 
-        def worker(size_inner, quality_inner, count_inner):
+        def worker(prompt_inner, ref_data_urls_inner, size_inner, quality_inner, count_inner):
             try:
-                prompt = webview.windows[0].evaluate_js('window.__currentPrompt')
                 ref_bytes_list = []
                 if is_edit:
-                    ref_data_urls = webview.windows[0].evaluate_js('window.__currentRefImgs') or []
-                    if not ref_data_urls:
+                    if not ref_data_urls_inner:
                         self._js('__onGenError(' + json.dumps(gen_id, ensure_ascii=False) +
                                  ', "未获取到参考图")')
                         return
-                    for data_url in ref_data_urls:
+                    for data_url in ref_data_urls_inner:
                         b64_part = data_url.split(',', 1)[1] if ',' in data_url else data_url
                         ref_bytes_list.append(base64.b64decode(b64_part))
-                elif not prompt:
+                elif not prompt_inner:
                     self._js('__onGenError(' + json.dumps(gen_id, ensure_ascii=False) +
                              ', "未获取到提示词")')
                     return
@@ -208,11 +198,9 @@ class Api:
                 client = OpenAI(api_key=self.key, base_url=self.base_url)
                 got = 0
                 for _ in range(count_inner):
-                    if self._is_canceled(gen_id):
-                        break
                     try:
                         b64 = self._call_image_api(
-                            client, prompt, ref_bytes_list, size_inner, quality_inner, is_edit
+                            client, prompt_inner, ref_bytes_list, size_inner, quality_inner, is_edit
                         )
                     except Exception as e:
                         # 已产出部分结果时不整批报错，仅提示这一张失败
@@ -220,32 +208,26 @@ class Api:
                             self._js('__onGenPartial(' + json.dumps(gen_id, ensure_ascii=False) + ')')
                             break
                         raise e
-                    # 请求返回后再查一次取消状态，取消则丢弃结果不落库
-                    if self._is_canceled(gen_id):
-                        break
                     entry_id = self._save_history_entry(
-                        prompt, b64, size_inner, quality_inner,
+                        prompt_inner, b64, size_inner, quality_inner,
                         ref_bytes_list if is_edit else None
                     )
                     got += 1
-                    self._push_item(gen_id, b64, entry_id, got, count_inner)
+                    self._push_item(gen_id, entry_id, got, count_inner)
 
-                if self._is_canceled(gen_id):
-                    self._js('__onGenCanceled(' + json.dumps(gen_id, ensure_ascii=False) + ')')
-                else:
-                    self._js('__onGenDone(' + json.dumps(gen_id, ensure_ascii=False) +
-                             ',' + str(got) + ')')
+                self._js('__onGenDone(' + json.dumps(gen_id, ensure_ascii=False) +
+                         ',' + str(got) + ')')
             except Exception as e:
                 error_msg = str(e)
                 if len(error_msg) > 300:
                     error_msg = error_msg[:300] + '...'
                 self._js('__onGenError(' + json.dumps(gen_id, ensure_ascii=False) + ',' +
                          json.dumps(error_msg, ensure_ascii=False) + ')')
-            finally:
-                self._clear_canceled(gen_id)
 
-        # 立即开启子线程，主函数瞬间返回，UI 永远不会卡
-        threading.Thread(target=worker, args=(size, quality, count), daemon=True).start()
+        # 立即开启子线程，主函数瞬间返回，UI 永远不会卡；多个批次的线程互相独立，可以同时进行
+        threading.Thread(
+            target=worker, args=(prompt, ref_data_urls, size, quality, count), daemon=True
+        ).start()
 
     def _call_image_api(self, client, prompt, ref_bytes_list, size, quality, is_edit):
         """执行单次图片 API 调用，返回 b64 字符串。"""
@@ -291,11 +273,63 @@ class Api:
         with open(self.history_path, 'w', encoding='utf-8') as f:
             json.dump(entries, f, ensure_ascii=False, indent=2)
 
+    def _read_b64(self, filename):
+        """按文件名读取历史目录下的文件并转 base64；文件不存在/已删除时返回 None"""
+        if not filename:
+            return None
+        try:
+            with open(os.path.join(self.history_dir, filename), 'rb') as f:
+                return base64.b64encode(f.read()).decode('ascii')
+        except Exception:
+            return None
+
+    def _make_thumbnail(self, image_bytes):
+        """生成侧边栏用的小尺寸缩略图（JPEG，体积远小于原图），失败时返回 None 由调用方回退"""
+        try:
+            img = Image.open(io.BytesIO(image_bytes))
+            img.thumbnail((THUMB_MAX_SIZE, THUMB_MAX_SIZE), Image.Resampling.LANCZOS)
+            if img.mode in ('RGBA', 'P', 'LA'):
+                img = img.convert('RGB')
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=82)
+            return buf.getvalue()
+        except Exception:
+            return None
+
+    def _delete_entry_files(self, entry):
+        """删除某条历史记录对应的原图/缩略图/参考图文件（找不到时静默跳过）"""
+        filenames = [entry.get('filename', ''), entry.get('thumb_filename', '')]
+        filenames.extend(entry.get('ref_filenames', []))
+        for name in filenames:
+            if not name:
+                continue
+            try:
+                os.remove(os.path.join(self.history_dir, name))
+            except OSError:
+                pass
+
+    def _trim_history_entries(self, entries):
+        """历史记录超过上限时，删除最旧记录的文件并从列表中移除，避免历史无限增长拖慢启动"""
+        if len(entries) <= MAX_HISTORY_ENTRIES:
+            return entries
+        keep = entries[:MAX_HISTORY_ENTRIES]
+        for entry in entries[MAX_HISTORY_ENTRIES:]:
+            self._delete_entry_files(entry)
+        return keep
+
     def _save_history_entry(self, prompt, b64, size, quality, ref_bytes_list=None):
         entry_id = uuid.uuid4().hex
         filename = entry_id + '.png'
+        image_bytes = base64.b64decode(b64)
         with open(os.path.join(self.history_dir, filename), 'wb') as f:
-            f.write(base64.b64decode(b64))
+            f.write(image_bytes)
+
+        thumb_filename = ''
+        thumb_bytes = self._make_thumbnail(image_bytes)
+        if thumb_bytes is not None:
+            thumb_filename = entry_id + '_thumb.jpg'
+            with open(os.path.join(self.history_dir, thumb_filename), 'wb') as f:
+                f.write(thumb_bytes)
 
         ref_filenames = []
         for i, ref_bytes in enumerate(ref_bytes_list or []):
@@ -309,40 +343,67 @@ class Api:
             'id': entry_id,
             'prompt': prompt,
             'filename': filename,
+            'thumb_filename': thumb_filename,
             'ref_filenames': ref_filenames,
             'size': size,
             'quality': quality,
             'created_at': time.time()
         })
+        entries = self._trim_history_entries(entries)
         self._save_history_entries(entries)
         return entry_id
 
     def get_history(self):
-        """读取本地保存的历史记录，返回给前端在侧边栏展示"""
+        """读取历史记录列表，仅返回缩略图供侧边栏展示。
+        原图和参考图体积大，改为用户实际需要查看时（点击历史项/新图生成完成）
+        再通过 get_history_item 按需读取，避免启动时一次性加载全部原图拖慢启动、占用内存。"""
         result = []
         for entry in self._load_history_entries():
-            filepath = os.path.join(self.history_dir, entry.get('filename', ''))
-            try:
-                with open(filepath, 'rb') as f:
-                    b64 = base64.b64encode(f.read()).decode('ascii')
-            except Exception:
+            thumb_filename = entry.get('thumb_filename', '')
+            b64 = self._read_b64(thumb_filename)
+            is_thumb = b64 is not None
+            if b64 is None:
+                # 兼容更新前生成的历史记录（当时还没有缩略图文件），回退读取原图
+                b64 = self._read_b64(entry.get('filename', ''))
+            if b64 is None:
                 continue
-            ref_images = []
-            for ref_filename in entry.get('ref_filenames', []):
-                try:
-                    with open(os.path.join(self.history_dir, ref_filename), 'rb') as f:
-                        ref_images.append(base64.b64encode(f.read()).decode('ascii'))
-                except Exception:
-                    pass
             result.append({
                 'id': entry.get('id'),
                 'prompt': entry.get('prompt', ''),
-                'size': entry.get('size', ''),
-                'quality': entry.get('quality', ''),
-                'image': b64,
-                'ref_images': ref_images
+                'thumbnail': b64,
+                'thumb_mime': 'image/jpeg' if is_thumb else 'image/png'
             })
         return result
+
+    def get_history_item(self, entry_id):
+        """按需读取单条历史记录的原图 + 参考图（用于查看大图/还原卡片/新图推送展示）"""
+        entry = next((e for e in self._load_history_entries() if e.get('id') == entry_id), None)
+        if entry is None:
+            return {'ok': False, 'msg': '记录不存在或已被删除'}
+        b64 = self._read_b64(entry.get('filename', ''))
+        if b64 is None:
+            return {'ok': False, 'msg': '图片文件缺失'}
+        thumb_filename = entry.get('thumb_filename', '')
+        thumb_b64 = self._read_b64(thumb_filename)
+        is_thumb = thumb_b64 is not None
+        if thumb_b64 is None:
+            thumb_b64 = b64
+        ref_images = []
+        for ref_filename in entry.get('ref_filenames', []):
+            ref_b64 = self._read_b64(ref_filename)
+            if ref_b64 is not None:
+                ref_images.append(ref_b64)
+        return {
+            'ok': True,
+            'id': entry.get('id'),
+            'prompt': entry.get('prompt', ''),
+            'size': entry.get('size', ''),
+            'quality': entry.get('quality', ''),
+            'image': b64,
+            'thumbnail': thumb_b64,
+            'thumb_mime': 'image/jpeg' if is_thumb else 'image/png',
+            'ref_images': ref_images
+        }
 
     def delete_history_item(self, entry_id):
         entries = self._load_history_entries()
@@ -354,15 +415,7 @@ class Api:
             else:
                 remaining.append(entry)
         if removed:
-            try:
-                os.remove(os.path.join(self.history_dir, removed.get('filename', '')))
-            except OSError:
-                pass
-            for ref_filename in removed.get('ref_filenames', []):
-                try:
-                    os.remove(os.path.join(self.history_dir, ref_filename))
-                except OSError:
-                    pass
+            self._delete_entry_files(removed)
         self._save_history_entries(remaining)
         return {'success': True}
 
@@ -386,6 +439,15 @@ class Api:
             return {'success': False, 'error': str(e)}
 
 
+def _get_icon_path():
+    # Windows 用 .ico，macOS 的 pywebview(NSImage) 不认 ico，用 .png/.icns
+    icon_name = 'app.icns' if sys.platform == 'darwin' else 'app.ico'
+    if getattr(sys, 'frozen', False):
+        return os.path.join(sys._MEIPASS, 'icon', icon_name)
+    else:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon', icon_name)
+
+
 if __name__ == '__main__':
     api = Api()
     html_path = api._get_html_path()
@@ -398,4 +460,4 @@ if __name__ == '__main__':
         min_size=(760, 640),
         text_select=True
     )
-    webview.start()
+    webview.start(icon=_get_icon_path())
