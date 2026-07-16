@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -m PyInstaller --version)",
+      "Bash(python -m PyInstaller --noconfirm --onefile --windowed --name \"梯度云AI生图\" --icon \"icon/app.ico\" --add-data \"index.html;.\" --add-data \"icon/app.ico;icon\" main.py)",
+      "Bash(python -m PyInstaller --noconfirm --onefile --windowed --name \"TdyunArt\" --icon \"icon/app.ico\" --add-data \"index.html;.\" --add-data \"icon/app.ico;icon\" main.py)",
+      "Bash(timeout 8 ./TdyunArt.exe)",
+      "Bash(echo \"exit: $?\")"
+    ]
+  }
+}

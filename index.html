@@ -240,7 +240,7 @@ body {
 .card-grid[data-count="3"] .grid-item img,
 .card-grid[data-count="4"] .grid-item img { max-height: var(--img-max-h-multi); }
 .grid-item img:hover { opacity: 0.85; }
-.grid-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.grid-actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
 
 .card-canceled-tip {
     padding: 10px 16px 14px; font-size: 12px; color: var(--fg-dim);
@@ -620,7 +620,7 @@ body {
             <div class="field">
                 <label>API Key</label>
                 <input type="password" id="fKey" placeholder="sk-xxxxxxxxxxxxxxxx">
-                <span class="hint">仅保存在本地 exe 同目录的 config.json，不会上传</span>
+                <span class="hint">仅保存在本地用户目录（~/.tdyun/config.json），不会上传</span>
             </div>
             <div class="field">
                 <label>模型</label>
@@ -897,7 +897,9 @@ function toggleTheme() {
     var light = !document.body.classList.contains('light');
     var theme = light ? 'light' : 'dark';
     applyTheme(theme);
-    try { window.pywebview.api.save_theme(theme); } catch(e) {}
+    window.pywebview.api.save_theme(theme).then(function(r) {
+        if (r && r.success === false) toast('主题保存失败：' + (r.error || '未知错误'), 'err');
+    }).catch(function() {});
 }
 
 var DEFAULT_MODEL = 'gpt-image-2';
@@ -993,7 +995,11 @@ async function saveCfg() {
     if (!key) { toast('请填写 API Key', 'err'); return; }
     if (!model) { toast('请选择模型', 'err'); return; }
     try {
-        await window.pywebview.api.save_config(key, model);
+        var r = await window.pywebview.api.save_config(key, model);
+        if (r && r.success === false) {
+            toast('保存失败：' + (r.error || '未知错误'), 'err');
+            return;
+        }
         closeCfg();
         toast('配置已保存', 'ok');
         await refreshConfig();
@@ -1133,7 +1139,7 @@ function doGenerate() {
 /* ========== 卡片构建 ========== */
 function refImgsHtml(refImgs) {
     if (!refImgs || !refImgs.length) return '';
-    var imgs = refImgs.map(function(src) { return '<img src="' + src + '" alt="参考图">'; }).join('');
+    var imgs = refImgs.map(function(src) { return '<img src="' + src + '" alt="参考图" onclick="openLightbox(this.src)">'; }).join('');
     return '<div class="card-refimgs">' + imgs + '</div>';
 }
 
@@ -1162,6 +1168,7 @@ function gridItemHtml(prompt, b64, entryId) {
         '<div class="grid-img-wrap"><img src="' + imgSrc + '" alt="生成结果"></div>' +
         '<div class="grid-actions">' +
             '<button class="btn-sm" data-act="dl">下载</button>' +
+            '<button class="btn-sm" data-act="cpimg">复制图片</button>' +
             '<button class="btn-sm" data-act="cp">复制提示词</button>' +
         '</div>' +
     '</div>';
@@ -1170,6 +1177,7 @@ function gridItemHtml(prompt, b64, entryId) {
 function bindGridItem(item, prompt) {
     item.querySelector('img').onclick = function() { openLightbox(this.src); };
     item.querySelector('[data-act="dl"]').onclick = function() { dlImg(this); };
+    item.querySelector('[data-act="cpimg"]').onclick = function() { cpImg(this); };
     item.querySelector('[data-act="cp"]').onclick = function() { cpText(prompt); };
 }
 
@@ -1271,6 +1279,24 @@ async function dlImg(btn) {
             toast('保存失败', 'err');
         }
     } catch(e) { toast('保存失败', 'err'); }
+}
+
+/* ========== 复制图片 ========== */
+async function cpImg(btn) {
+    var scope = btn.closest('.grid-item') || btn.closest('.card');
+    var img = scope ? scope.querySelector('img') : null;
+    if (!img || !img.src) return;
+    try {
+        // 不要提前 await 拿 blob 再传值：Safari/WebKit 要求 clipboard.write
+        // 在用户手势内同步调用，提前 await 会丢失手势上下文导致写入被拒绝。
+        var src = img.src;
+        await navigator.clipboard.write([
+            new ClipboardItem({
+                'image/png': fetch(src).then(function(res) { return res.blob(); })
+            })
+        ]);
+        toast('已复制到剪贴板', 'ok');
+    } catch(e) { toast('复制失败', 'err'); }
 }
 
 /* ========== 复制文本 ========== */

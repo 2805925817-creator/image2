@@ -17,6 +17,9 @@ BASE_URL = "https://tdyun.ai/v1"
 MAX_HISTORY_ENTRIES = 300
 # 侧边栏缩略图长边上限（像素），缩略图仅用于列表展示，无需原图分辨率
 THUMB_MAX_SIZE = 240
+# 窗口默认尺寸（首次启动或读取失败时使用），需与 create_window 的 min_size 保持合理关系
+DEFAULT_WIN_WIDTH = 1040
+DEFAULT_WIN_HEIGHT = 920
 
 
 class Api:
@@ -29,11 +32,17 @@ class Api:
         self.base_url = BASE_URL
         self.model = "gpt-image-2"
         self.theme = "dark"  # 界面主题：dark / light
+        # 窗口尺寸/位置：记住用户上次手动调整的大小，下次启动时还原
+        self.win_width = DEFAULT_WIN_WIDTH
+        self.win_height = DEFAULT_WIN_HEIGHT
+        self.win_x = None
+        self.win_y = None
         self._load_config()
 
     def _get_config_path(self):
-        if sys.platform == 'darwin':
-            # macOS: 存到用户目录下的 ~/.tdyun，避免写入 .app 包内部（权限/签名问题）
+        if sys.platform == 'darwin' or sys.platform == 'win32':
+            # macOS/Windows: 统一存到用户目录下的 ~/.tdyun（Windows 即 C:\Users\<用户名>\.tdyun）
+            # 避免写入 .app 包内部或程序安装目录（权限/签名问题，且卸载重装时配置和历史图片不会丢失）
             data_dir = os.path.join(os.path.expanduser('~'), '.tdyun')
             os.makedirs(data_dir, exist_ok=True)
             return os.path.join(data_dir, 'config.json')
@@ -56,8 +65,26 @@ class Api:
                     self.key = config.get('api_key', '')
                     self.model = config.get('model', self.model)
                     self.theme = config.get('theme', self.theme)
+                    win = config.get('window') or {}
+                    self.win_width = self._sanitize_win_size(win.get('width'), DEFAULT_WIN_WIDTH)
+                    self.win_height = self._sanitize_win_size(win.get('height'), DEFAULT_WIN_HEIGHT)
+                    self.win_x = self._sanitize_win_pos(win.get('x'))
+                    self.win_y = self._sanitize_win_pos(win.get('y'))
             except Exception:
                 pass
+
+    def _sanitize_win_size(self, value, default):
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    def _sanitize_win_pos(self, value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def get_config(self):
         masked_key = ""
@@ -79,14 +106,35 @@ class Api:
             json.dump({
                 'api_key': self.key,
                 'model': self.model,
-                'theme': self.theme
+                'theme': self.theme,
+                'window': {
+                    'width': self.win_width,
+                    'height': self.win_height,
+                    'x': self.win_x,
+                    'y': self.win_y
+                }
             }, f, ensure_ascii=False, indent=2)
 
     def save_config(self, api_key, model):
         self.key = api_key
         self.model = model
-        self._write_config()
+        try:
+            self._write_config()
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
         return {'success': True}
+
+    def _save_window_geometry(self):
+        """记录窗口关闭前的最终尺寸/位置，供下次启动还原；异常（如磁盘写入失败）静默忽略，不阻塞退出"""
+        try:
+            window = webview.windows[0]
+            self.win_width = window.width
+            self.win_height = window.height
+            self.win_x = window.x
+            self.win_y = window.y
+            self._write_config()
+        except Exception:
+            pass
 
     def list_models(self, api_key=""):
         """拉取中转站支持的模型列表，供设置弹窗自动获取模型 ID。
@@ -108,7 +156,10 @@ class Api:
     def save_theme(self, theme):
         """单独持久化主题，避免和接口设置耦合"""
         self.theme = 'light' if theme == 'light' else 'dark'
-        self._write_config()
+        try:
+            self._write_config()
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
         return {'success': True}
 
     def test_connection(self, api_key, model):
@@ -451,13 +502,17 @@ def _get_icon_path():
 if __name__ == '__main__':
     api = Api()
     html_path = api._get_html_path()
+    min_w, min_h = 760, 640
     window = webview.create_window(
         '梯度云·AI生图 - TDYUN AI Art',
         html_path,
         js_api=api,
-        width=1040,
-        height=920,
-        min_size=(760, 640),
+        width=max(api.win_width, min_w),
+        height=max(api.win_height, min_h),
+        x=api.win_x,
+        y=api.win_y,
+        min_size=(min_w, min_h),
         text_select=True
     )
+    window.events.closing += api._save_window_geometry
     webview.start(icon=_get_icon_path())

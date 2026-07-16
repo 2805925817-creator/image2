@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(timeout 5 python main.py)",
+      "Bash(python -c \"import webview; print\\(webview.__file__\\); print\\(webview.__version__ if hasattr\\(webview,'__version__'\\) else 'na'\\)\")",
+      "Bash(python -m py_compile \"d:\\\\Users\\\\G\\\\Documents\\\\测试用\\\\tdyun-image\\\\main.py\")",
+      "Bash(echo \"---exit:$?\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('main.py', doraise=True\\)\")",
+      "Bash(node -e ' *)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(git status *)",
+      "Bash(pip show *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Read(//c/Users/G/AppData/Local/Programs/Python/Python312/Lib/site-packages/webview/platforms/**)",
+      "Read(//c/Users/G/AppData/Local/Programs/Python/Python312/Lib/site-packages/webview/**)"
+    ]
+  }
+}
